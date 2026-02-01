@@ -22,6 +22,13 @@ interface MessageInfo {
   is_from_me: boolean;
 }
 
+interface MessageStats {
+  firstDate: Date | null;
+  lastDate: Date | null;
+  totalMessages: number;
+  messagesByYear: Map<number, number>;
+}
+
 function convertAppleTimestamp(timestamp: number): Date {
   const appleEpoch = new Date('2001-01-01T00:00:00Z').getTime();
   const milliseconds = timestamp / 1_000_000 + appleEpoch;
@@ -53,89 +60,128 @@ function getRecentMessages(db: Database.Database, identifier: string): MessageIn
   }));
 }
 
-function getFirstMessageDate(db: Database.Database, identifier: string): Date | null {
+function getMessageStats(db: Database.Database, identifier: string): MessageStats {
   const query = `
-    SELECT MIN(m.date) as first_date
+    SELECT m.date
     FROM message m
     JOIN handle h ON m.handle_id = h.ROWID
     WHERE h.id = ?
-      AND m.text IS NOT NULL
+      AND m.date IS NOT NULL
+    ORDER BY m.date ASC
   `;
 
-  const row = db.prepare(query).get(identifier) as { first_date: number | null };
-  return row?.first_date ? convertAppleTimestamp(row.first_date) : null;
+  const rows = db.prepare(query).all(identifier) as { date: number }[];
+
+  const messagesByYear = new Map<number, number>();
+  let firstDate: Date | null = null;
+  let lastDate: Date | null = null;
+
+  for (const row of rows) {
+    const date = convertAppleTimestamp(row.date);
+    const year = date.getFullYear();
+
+    if (!firstDate) firstDate = date;
+    lastDate = date;
+
+    messagesByYear.set(year, (messagesByYear.get(year) || 0) + 1);
+  }
+
+  return {
+    firstDate,
+    lastDate,
+    totalMessages: rows.length,
+    messagesByYear,
+  };
 }
 
-function analyzeMessages(
+function analyzeContact(
   messages: MessageInfo[],
-  firstMessageDate: Date | null
+  stats: MessageStats
 ): { category: string | null; reason: string } {
-  if (messages.length === 0) {
+  if (stats.totalMessages === 0) {
     return { category: null, reason: 'No messages found' };
   }
 
   const textContent = messages.map((m) => m.text.toLowerCase()).join(' ');
-  const firstDate = firstMessageDate;
 
   // Keywords that suggest Purdue/college context
   const purdueKeywords = [
-    'purdue', 'boiler', 'west lafayette', 'campus', 'dorm', 'class', 'professor',
+    'purdue', 'boiler', 'west lafayette', 'campus', 'dorm', 'professor',
     'exam', 'midterm', 'final', 'homework', 'study', 'library', 'lecture',
     'corec', 'pmu', 'walc', 'rawls', 'krannert', 'neil armstrong',
     'cs ', 'engineering', 'major', 'freshman', 'sophomore', 'junior', 'senior',
-    'internship', 'career fair', 'frat', 'sorority', 'rush'
+    'internship', 'career fair', 'frat', 'sorority', 'rush', 'chauncey'
   ];
 
   // Keywords that suggest high school context
   const highSchoolKeywords = [
     'high school', 'homecoming', 'prom', 'sat', 'act', 'college app',
-    'graduation', 'senior year', 'junior year', 'ap class', 'varsity',
-    'jv', 'driver', 'permit', 'license', 'parent', 'grounded'
+    'senior year', 'junior year', 'ap class', 'varsity',
+    'jv', 'grounded', 'monta vista', 'mvhs', 'cupertino'
   ];
 
   // Check for keyword matches
   const hasPurdueKeyword = purdueKeywords.some((kw) => textContent.includes(kw));
   const hasHighSchoolKeyword = highSchoolKeywords.some((kw) => textContent.includes(kw));
 
-  // Analyze first message date to determine era
-  if (firstDate) {
-    const year = firstDate.getFullYear();
+  const firstYear = stats.firstDate?.getFullYear();
 
-    // If first contact was during high school years (before 2018)
+  // Calculate message concentration in different eras
+  let hsMessages = 0;  // Before 2018
+  let collegeMessages = 0;  // 2018-2020
+  let postCollegeMessages = 0;  // After 2020
+
+  for (const [year, count] of stats.messagesByYear) {
     if (year < HIGH_SCHOOL_GRAD_YEAR) {
-      if (hasPurdueKeyword && !hasHighSchoolKeyword) {
-        return { category: 'purdue', reason: `First contact ${year}, but mentions Purdue topics` };
-      }
-      return { category: 'high-school', reason: `First contact in ${year} (before HS graduation)` };
-    }
-
-    // If first contact was during college years (2018-2020)
-    if (year >= HIGH_SCHOOL_GRAD_YEAR && year <= COLLEGE_GRAD_YEAR) {
-      if (hasHighSchoolKeyword && !hasPurdueKeyword) {
-        return { category: 'high-school', reason: `First contact ${year}, but mentions HS topics` };
-      }
-      return { category: 'purdue', reason: `First contact in ${year} (during college)` };
-    }
-
-    // If first contact was after college
-    if (year > COLLEGE_GRAD_YEAR) {
-      // Can't determine school affiliation from recent contacts
-      if (hasPurdueKeyword) {
-        return { category: 'purdue', reason: `First contact ${year}, mentions Purdue` };
-      }
-      if (hasHighSchoolKeyword) {
-        return { category: 'high-school', reason: `First contact ${year}, mentions high school` };
-      }
-      return { category: null, reason: `First contact in ${year} (post-college, no clear affiliation)` };
+      hsMessages += count;
+    } else if (year >= HIGH_SCHOOL_GRAD_YEAR && year <= COLLEGE_GRAD_YEAR) {
+      collegeMessages += count;
+    } else {
+      postCollegeMessages += count;
     }
   }
 
-  // Fallback to keyword analysis if no date
+  const total = stats.totalMessages;
+  const hsRatio = hsMessages / total;
+  const collegeRatio = collegeMessages / total;
+  const postCollegeRatio = postCollegeMessages / total;
+
+  // Strong keyword signals override everything
   if (hasPurdueKeyword && !hasHighSchoolKeyword) {
     return { category: 'purdue', reason: 'Message content mentions Purdue topics' };
   }
   if (hasHighSchoolKeyword && !hasPurdueKeyword) {
     return { category: 'high-school', reason: 'Message content mentions high school topics' };
+  }
+
+  // First contact date analysis
+  if (firstYear) {
+    // Clear high school era contact
+    if (firstYear < HIGH_SCHOOL_GRAD_YEAR) {
+      // If mostly HS-era messages, it's a HS friend
+      if (hsRatio > 0.3 || (collegeRatio < 0.5 && postCollegeRatio < 0.5)) {
+        return { category: 'high-school', reason: `First contact ${firstYear}, ${Math.round(hsRatio * 100)}% HS-era msgs` };
+      }
+      // If they kept messaging through college, could be either
+      if (collegeRatio > 0.4) {
+        return { category: 'purdue', reason: `First contact ${firstYear}, but ${Math.round(collegeRatio * 100)}% college-era msgs` };
+      }
+      return { category: 'high-school', reason: `First contact ${firstYear} (before HS graduation)` };
+    }
+
+    // Clear college era contact
+    if (firstYear >= HIGH_SCHOOL_GRAD_YEAR && firstYear <= COLLEGE_GRAD_YEAR) {
+      return { category: 'purdue', reason: `First contact ${firstYear} (during college)` };
+    }
+
+    // Post-college contact - check if they have any college-era history
+    if (firstYear > COLLEGE_GRAD_YEAR) {
+      if (collegeRatio > 0.2) {
+        return { category: 'purdue', reason: `First msg ${firstYear}, but ${Math.round(collegeRatio * 100)}% college-era msgs` };
+      }
+      // These are genuinely post-college contacts, leave uncategorized
+      return { category: null, reason: `First contact ${firstYear} (post-college, no school affiliation)` };
+    }
   }
 
   return { category: null, reason: 'Could not determine category from messages' };
@@ -145,12 +191,9 @@ function findDuplicates(
   contacts: UncategorizedContact[]
 ): Map<string, UncategorizedContact[]> {
   const duplicates = new Map<string, UncategorizedContact[]>();
-
-  // Group by normalized identifier
   const byIdentifier = new Map<string, UncategorizedContact[]>();
 
   for (const contact of contacts) {
-    // Normalize phone numbers
     let normalized = contact.identifier;
     if (!contact.identifier.includes('@')) {
       normalized = contact.identifier.replace(/\D/g, '');
@@ -166,7 +209,6 @@ function findDuplicates(
     byIdentifier.set(normalized, existing);
   }
 
-  // Find groups with more than one contact
   for (const [identifier, group] of byIdentifier) {
     if (group.length > 1) {
       duplicates.set(identifier, group);
@@ -188,7 +230,6 @@ async function main() {
 
   console.log('Fetching uncategorized contacts from Neon...');
 
-  // Get all uncategorized contacts
   const uncategorized = await sql`
     SELECT id, identifier, display_name, custom_name
     FROM contacts
@@ -197,14 +238,21 @@ async function main() {
 
   console.log(`Found ${uncategorized.length} uncategorized contacts\n`);
 
-  // Analyze and categorize
-  let categorizedCount = 0;
   const categorizations: { id: string; category: string; name: string; reason: string }[] = [];
+  let skipped = 0;
 
   for (const contact of uncategorized) {
+    // Skip business/bot identifiers
+    if (contact.identifier.includes('urn:biz:') ||
+        contact.identifier.includes('p:') ||
+        /^\d{5,6}$/.test(contact.identifier.replace(/\D/g, ''))) {
+      skipped++;
+      continue;
+    }
+
     const messages = getRecentMessages(chatDb, contact.identifier);
-    const firstDate = getFirstMessageDate(chatDb, contact.identifier);
-    const { category, reason } = analyzeMessages(messages, firstDate);
+    const stats = getMessageStats(chatDb, contact.identifier);
+    const { category, reason } = analyzeContact(messages, stats);
 
     if (category) {
       categorizations.push({
@@ -213,38 +261,40 @@ async function main() {
         name: contact.custom_name || contact.display_name || contact.identifier,
         reason,
       });
-      categorizedCount++;
     }
   }
 
-  // Update categories in database
-  console.log(`\nCategorizing ${categorizedCount} contacts...\n`);
+  console.log(`Skipped ${skipped} business/bot identifiers\n`);
 
   const purdueContacts = categorizations.filter((c) => c.category === 'purdue');
   const hsContacts = categorizations.filter((c) => c.category === 'high-school');
 
+  console.log(`Categorizing ${categorizations.length} contacts...\n`);
+
   console.log(`Purdue (${purdueContacts.length}):`);
-  for (const c of purdueContacts.slice(0, 10)) {
+  for (const c of purdueContacts.slice(0, 15)) {
     console.log(`  - ${c.name}: ${c.reason}`);
-    await sql`UPDATE contacts SET category_id = 'purdue', updated_at = NOW() WHERE id = ${c.id}`;
   }
-  if (purdueContacts.length > 10) {
-    console.log(`  ... and ${purdueContacts.length - 10} more`);
-    for (const c of purdueContacts.slice(10)) {
-      await sql`UPDATE contacts SET category_id = 'purdue', updated_at = NOW() WHERE id = ${c.id}`;
-    }
+  if (purdueContacts.length > 15) {
+    console.log(`  ... and ${purdueContacts.length - 15} more`);
+  }
+
+  // Update Purdue contacts
+  for (const c of purdueContacts) {
+    await sql`UPDATE contacts SET category_id = 'purdue', updated_at = NOW() WHERE id = ${c.id}`;
   }
 
   console.log(`\nHigh School (${hsContacts.length}):`);
-  for (const c of hsContacts.slice(0, 10)) {
+  for (const c of hsContacts.slice(0, 15)) {
     console.log(`  - ${c.name}: ${c.reason}`);
-    await sql`UPDATE contacts SET category_id = 'high-school', updated_at = NOW() WHERE id = ${c.id}`;
   }
-  if (hsContacts.length > 10) {
-    console.log(`  ... and ${hsContacts.length - 10} more`);
-    for (const c of hsContacts.slice(10)) {
-      await sql`UPDATE contacts SET category_id = 'high-school', updated_at = NOW() WHERE id = ${c.id}`;
-    }
+  if (hsContacts.length > 15) {
+    console.log(`  ... and ${hsContacts.length - 15} more`);
+  }
+
+  // Update High School contacts
+  for (const c of hsContacts) {
+    await sql`UPDATE contacts SET category_id = 'high-school', updated_at = NOW() WHERE id = ${c.id}`;
   }
 
   // Find and archive duplicates
@@ -252,40 +302,43 @@ async function main() {
   const duplicates = findDuplicates(uncategorized);
 
   if (duplicates.size > 0) {
-    console.log(`Found ${duplicates.size} groups of duplicate contacts:`);
+    console.log(`Found ${duplicates.size} groups of duplicate contacts`);
     let archivedCount = 0;
 
-    for (const [identifier, group] of duplicates) {
-      // Keep the one with the most complete info, archive the rest
+    for (const [, group] of duplicates) {
       const sorted = group.sort((a, b) => {
-        // Prefer ones with display names
         const aHasName = a.custom_name || a.display_name ? 1 : 0;
         const bHasName = b.custom_name || b.display_name ? 1 : 0;
         return bHasName - aHasName;
       });
 
-      const keep = sorted[0];
       const toArchive = sorted.slice(1);
-
-      console.log(`  ${identifier}: keeping "${keep.custom_name || keep.display_name || keep.identifier}"`);
-
       for (const dup of toArchive) {
-        console.log(`    - archiving "${dup.custom_name || dup.display_name || dup.identifier}"`);
         await sql`UPDATE contacts SET category_id = 'archived', updated_at = NOW() WHERE id = ${dup.id}`;
         archivedCount++;
       }
     }
 
-    console.log(`\nArchived ${archivedCount} duplicate contacts`);
+    console.log(`Archived ${archivedCount} duplicate contacts`);
   } else {
     console.log('No duplicate contacts found');
   }
 
   chatDb.close();
 
-  console.log('\n✅ Analysis complete!');
-  console.log(`  - Categorized ${purdueContacts.length} as Purdue`);
-  console.log(`  - Categorized ${hsContacts.length} as High School`);
+  // Get final counts
+  const finalCounts = await sql`
+    SELECT category_id, COUNT(*) as count
+    FROM contacts
+    GROUP BY category_id
+    ORDER BY count DESC
+  `;
+
+  console.log('\n✅ Analysis complete!\n');
+  console.log('Final category counts:');
+  for (const row of finalCounts) {
+    console.log(`  ${row.category_id}: ${row.count}`);
+  }
 }
 
 main().catch(console.error);
